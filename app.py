@@ -10,7 +10,7 @@ import torch
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
 
 HF_REPO_ID = os.getenv("HF_REPO_ID", "").strip()
 HF_TOKEN = os.getenv("HF_TOKEN", "").strip()
@@ -30,17 +30,6 @@ app.add_middleware(
 model_holder = {"tokenizer": None, "model": None}
 state = {"model_loaded": False, "error": None, "started_at": time.time()}
 generation_lock = threading.Lock()
-
-try:
-    torch.set_num_threads(2)
-except Exception:
-    pass
-
-# --- Safety: crisis detection -------------------------------------------
-# Keyword + pattern matching. This is a floor, not clinical-grade
-# detection — it WILL miss things. Deliberately fail-closed: on any
-# match, the safety reply is returned and nothing else runs, including
-# the model. See the closing note before any public release of this.
 
 CRISIS_TRIGGERS = [
     "kill myself", "suicide", "end my life", "want to die", "wanna die",
@@ -83,7 +72,7 @@ META_PHRASES = [
 ]
 
 HOSTILE_META_PHRASES = [
-    "you suck", "you are worse", "you're terrible", "you feel like a bit",
+    "you suck", "you are worse", "you're terrible",
     "you're not getting what", "you don't get it", "i hate you"
 ]
 
@@ -140,14 +129,11 @@ def clean_reply(text):
         idx = text.find(stop)
         if idx != -1:
             text = text[:idx].strip()
-
     if text.isupper() and len(text) > 3:
         text = text.lower()
-
     text = text.lstrip(string.punctuation + " ").strip()
     if not text:
         return ""
-
     if text[0].islower():
         low = text.lower()
         if low.startswith("i'm"):
@@ -158,11 +144,9 @@ def clean_reply(text):
             text = "I " + text[1:]
         else:
             text = text[0].upper() + text[1:]
-
     words = text.split()
     if len(words) > 25:
         text = " ".join(words[:25]) + "."
-
     return normalize_text(text)
 
 def is_valid_reply(text):
@@ -195,9 +179,7 @@ def fallback_reply(user_text):
 def sentiment_guard(user_text, reply_text):
     user_low = user_text.lower()
     reply_low = reply_text.lower()
-    user_negative = any(word in user_low for word in NEGATIVE_WORDS)
-    reply_positive = any(word in reply_low for word in POSITIVE_REPLY_WORDS)
-    if user_negative and reply_positive:
+    if any(w in user_low for w in NEGATIVE_WORDS) and any(w in reply_low for w in POSITIVE_REPLY_WORDS):
         return "That sounds really hard. I'm here."
     return reply_text
 
@@ -249,17 +231,13 @@ def generate_text(prompt):
 def generate_reply(history, message):
     if is_crisis(message):
         return SAFETY_REPLY
-
     meta_reply = get_meta_reply(message)
     if meta_reply is not None:
         return meta_reply
-
     prompt = build_prompt(history, message)
     reply = generate_text(prompt)
-
     if not is_valid_reply(reply):
         reply = fallback_reply(message)
-
     return sentiment_guard(message, reply)
 
 def load_model_worker():
@@ -267,10 +245,22 @@ def load_model_worker():
         if not HF_REPO_ID:
             raise RuntimeError("HF_REPO_ID environment variable is missing.")
         token = HF_TOKEN if HF_TOKEN else None
+
         tokenizer = AutoTokenizer.from_pretrained(HF_REPO_ID, token=token)
-        model = AutoModelForCausalLM.from_pretrained(HF_REPO_ID, token=token, torch_dtype=torch.float32)
+
+        # Load in float16 to halve RAM usage vs float32.
+        # On CPU this still works — float16 math is slower but
+        # 512MB is simply not enough for float32 on Render's free tier.
+        model = AutoModelForCausalLM.from_pretrained(
+            HF_REPO_ID,
+            token=token,
+            torch_dtype=torch.float16,
+            low_cpu_mem_usage=True,
+        )
+
         if tokenizer.pad_token_id is None:
             tokenizer.pad_token_id = tokenizer.eos_token_id
+
         model.eval()
         model_holder["tokenizer"] = tokenizer
         model_holder["model"] = model
@@ -301,13 +291,11 @@ def health():
 def chat(req: ChatRequest):
     if not state["model_loaded"]:
         raise HTTPException(status_code=503, detail="Model not loaded yet. Error: " + str(state.get("error")))
-
     message = sanitize_user_text(req.message)
     if not message:
         raise HTTPException(status_code=400, detail="Message is empty after cleaning.")
     if len(message) > 500:
         message = message[:500]
-
     history = []
     for turn in req.history[-4:]:
         role = str(turn.role).lower().strip()
@@ -316,6 +304,5 @@ def chat(req: ChatRequest):
         text = sanitize_user_text(turn.text)
         if role in ["user", "kronar"] and text:
             history.append({"role": role, "text": text[:300]})
-
     reply = generate_reply(history, message)
     return {"reply": reply, "model": "kronar-ultimate", "status": "ok"}
