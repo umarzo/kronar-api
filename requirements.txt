@@ -3,4 +3,3 @@ uvicorn
 transformers
 safetensors
 huggingface_hub
-torch
