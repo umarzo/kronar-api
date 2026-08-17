@@ -4,17 +4,19 @@ import random
 import string
 import threading
 import time
+import gc
 from typing import List
 
 import torch
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+from transformers import AutoTokenizer, AutoModelForCausalLM
 
 HF_REPO_ID = os.getenv("HF_REPO_ID", "").strip()
 HF_TOKEN = os.getenv("HF_TOKEN", "").strip()
 ALLOWED_ORIGIN = os.getenv("ALLOWED_ORIGIN", "*").strip()
+MAX_NEW_TOKENS = int(os.getenv("MAX_NEW_TOKENS", "24"))
 
 app = FastAPI(title="Kronar API")
 
@@ -209,23 +211,30 @@ def generate_text(prompt):
     with generation_lock:
         with torch.no_grad():
             output = model.generate(
-                input_tensor, max_new_tokens=30, do_sample=False,
+                input_tensor, max_new_tokens=MAX_NEW_TOKENS, do_sample=False,
                 repetition_penalty=1.15, no_repeat_ngram_size=3,
                 pad_token_id=tokenizer.pad_token_id, eos_token_id=tokenizer.eos_token_id,
             )
-    reply = clean_reply(tokenizer.decode(output[0, input_tensor.shape[1]:], skip_special_tokens=True))
+        reply_ids = output[0, input_tensor.shape[1]:].clone()
+        del output
+    reply = clean_reply(tokenizer.decode(reply_ids, skip_special_tokens=True))
+    del reply_ids
     if is_valid_reply(reply):
         return reply
 
     with generation_lock:
         with torch.no_grad():
             output = model.generate(
-                input_tensor, max_new_tokens=30, do_sample=True,
+                input_tensor, max_new_tokens=MAX_NEW_TOKENS, do_sample=True,
                 temperature=0.7, top_k=40, top_p=0.92,
                 repetition_penalty=1.25, no_repeat_ngram_size=3,
                 pad_token_id=tokenizer.pad_token_id, eos_token_id=tokenizer.eos_token_id,
             )
-    reply = clean_reply(tokenizer.decode(output[0, input_tensor.shape[1]:], skip_special_tokens=True))
+        reply_ids = output[0, input_tensor.shape[1]:].clone()
+        del output
+    reply = clean_reply(tokenizer.decode(reply_ids, skip_special_tokens=True))
+    del reply_ids, input_tensor
+    gc.collect()
     return reply if is_valid_reply(reply) else ""
 
 def generate_reply(history, message):
@@ -262,6 +271,7 @@ def load_model_worker():
             tokenizer.pad_token_id = tokenizer.eos_token_id
 
         model.eval()
+        torch.set_num_threads(1)  # single-core Render free instance; avoid thread-pool overhead
         model_holder["tokenizer"] = tokenizer
         model_holder["model"] = model
         state["model_loaded"] = True
